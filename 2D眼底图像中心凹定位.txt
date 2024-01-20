@@ -1,0 +1,252 @@
+#导入相关包，函数
+from work.my_func.data_process import transfer_img_location,get_gauss_map,dark_kernel_process
+from work.my_func.data_info import train_lr,train_size,test_lr,test_size,get_img_path
+from work.my_func.model import Unet
+
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+from paddle.io import Dataset,DataLoader
+from paddle.nn import Linear,Dropout,BatchNorm1D
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import random
+import warnings
+from PIL import Image
+
+# 忽略警告输出
+warnings.filterwarnings("ignore")
+paddle.set_device('gpu')
+paddle.disable_static()
+#接收转换后的位置
+transfer_location_x = []
+transfer_location_y = []
+
+#遍历训练数据
+for index in range(100):
+    _,location = transfer_img_location(index,lr=train_lr[index],size=train_size[index],mode='train')
+    transfer_location_x.append(location[0])
+    transfer_location_y.append(location[1])
+
+#分析结果
+print('x的波动范围：{}'.format(np.max(transfer_location_x) - np.min(transfer_location_x)))
+print('y的波动范围：{}'.format(np.max(transfer_location_y) - np.min(transfer_location_y)))
+print('x的中值：{}'.format((np.max(transfer_location_x) + np.min(transfer_location_x))/2))
+print('y的中值：{}'.format((np.max(transfer_location_y) + np.min(transfer_location_y))/2))
+print('中央凹分布如下')
+
+plt.scatter(transfer_location_x,transfer_location_y)
+plt.show()
+#列表乱序，随机切分数据集
+random.seed(1024)
+all_data = [i for i in range(100)]
+random.shuffle(all_data)
+
+class TrainData(Dataset):
+    def __init__(self,fold_num):        #传入折数，1,2,3,4,5其中一个
+        super(TrainData,self).__init__()
+        self.num_samples = 80
+        self.fold_num = fold_num
+        self.sample_list = list(set(all_data) - set(all_data[(self.fold_num-1)*20:(self.fold_num-1)*20+20]))    #获取训练数据样本id
+
+    def __getitem__(self, index):
+        #读取图片和标签
+        index = self.sample_list[index]
+        img,location = transfer_img_location(index,lr=train_lr[index],size=train_size[index],mode='train')  #加载图片，位置
+
+        #以中央凹为中心，对图片做随即平移，防止网络只输出一个常量
+        #由于在训练时，每次看到的图片都不一样（平移量不一样），所以训练的epoch要多一点100或200轮
+        x,y = location
+        x,y = int(x),int(y)
+        move_x = random.randint(-240,240)
+        move_y = random.randint(-180,180)
+        x = x + move_x
+        y = y + move_y
+        img = img[:,x-304:x+304,y-200:y+200]
+
+        #转换输出类型为np.array,'float32'
+        features = np.array(img).astype('float32')
+        labels = np.array(get_gauss_map((304-move_x,200-move_y),sigma=1,r=80)).astype('float32') #标签是热力图的形式
+        return features,labels
+
+    def __len__(self):
+        return self.num_samples
+、#epoch:训练轮次，方便模型命名
+#train_size:计算归一化欧式距离
+#model:评估的模型
+#fold_num:与训练数据集相对应，使用剩下的20个样本进行评估
+#visual_avalible:是否可视化模型输出与输入图片，默认为False
+def evaluation(epoch,train_size,model,fold_num,visual_avalible=False): 
+
+    model.eval()
+    ED = 0      #归一化欧氏距离
+    valid_sample = all_data[(fold_num-1)*20:(fold_num-1)*20+20]
+
+    for index in valid_sample:
+        #加载数据，标签
+        img,location = transfer_img_location(index,lr=train_lr[index],size=train_size[index],mode='train')
+        img = img[:,836:1444,840:1240]
+        features = np.array(img).astype('float32')
+        labels = np.array(get_gauss_map(location)).astype('float32')
+
+        #模型预测
+        features = paddle.to_tensor([features])
+        pre = model(features)[0].numpy()
+        
+        #由于模型极少情况下预测的热力图是空白，因此分类讨论输出
+        if np.sum(pre) < 1000:
+            pre_x,pre_y = 304+80,200+40
+        else:
+            pre_x,pre_y = dark_kernel_process(pre[0])  #效果最好
+
+        #计算ED
+        x,y = np.array(location) - np.array([836,840])
+        if train_size[index] == 1:
+            ED = ED + (((pre_x - x)/2992)**2 + ((pre_y - y)/2000)**2)**(1/2)
+        else:
+            ED = ED + (((pre_x - x)/1956)**2 + ((pre_y - y)/1934)**2)**(1/2)
+
+        #可视化模型输出与输入图片
+        if visual_avalible:
+            print('第{}张图片'.format(index+1))
+            plt.subplot(121)
+            plt.imshow(pre[0].transpose(1,0))
+            plt.subplot(122)
+            plt.imshow(img.transpose(2,1,0))
+            plt.show()
+
+    ED = ED / 20
+    print('epoch:{},ED:{}'.format(epoch,ED))
+    #对效果较好的模型进行保存
+    if ED < 0.009:
+        paddle.save(model.state_dict(), 'model/model{}_ED{}.pdparams'.format(fold_num,ED)) #保存模型参数
+
+model.train()
+#传入三个参数model,opt,fold_num
+#建议使用GPU32G环境运送此项目
+def train(model,opt,fold_num,EPOCH_NUM=200,visual_avalible=False):    #加载预训练模型再训练时，可将此处设置为100
+    use_gpu = True
+    paddle.set_device('gpu:0') if use_gpu else paddle.set_device('cpu')
+    model.train()
+
+    for epoch_id in range(EPOCH_NUM):
+        for batch_id,data in enumerate(train_loader()):
+            #读取数据
+            features,labels = data
+            features = paddle.to_tensor(features)
+            labels = paddle.to_tensor(labels)
+
+            #前向传播
+            predicts = model(features)
+
+            #使用均方误差，同时增加了对模型方差的控制，希望模型的预测热力图能集中在一个区域，因此需要增加方差，在代价函数中采用-0.0005的系数
+            loss = F.square_error_cost(predicts,labels) - 0.0005 * paddle.var(predicts)
+
+            #反向传播
+            avg_loss = paddle.mean(loss)
+            avg_loss.backward()
+
+            #更新参数
+            opt.step()
+
+            #变量梯度清0
+            opt.clear_grad()
+
+            #打印损失
+            if batch_id % 3 == 0:
+                print('epoch_id:{},loss:{}'.format(epoch_id,avg_loss.numpy()))
+        
+        evaluation(epoch_id,train_size,model,fold_num,visual_avalible=visual_avalible)  #需要可视化时，添加visual_avalible=True
+'''
+由于训练每个模型需要20G以上显存，因此训练好一个模型以后，请重启内核再训练下一个模型，防止显存溢出。
+'''
+#加载模型
+model = Unet()
+
+#加载预训练模型，预训练模型是在100个样本上进行的训练
+layer_state_dict = paddle.load("model/model_epoch101_batch12_loss[0.46564353].pdparams")
+model.set_state_dict(layer_state_dict)
+
+#定义优化器
+opt = paddle.optimizer.Adam(learning_rate=5e-4,parameters=model.parameters(),weight_decay=paddle.regularizer.L2Decay(coeff=0.001))
+
+#定义fold_num,从1到5共训练五个模型
+fold_num = 1    
+train_data = TrainData(fold_num)        
+train_loader = DataLoader(train_data,batch_size=10,shuffle=True,drop_last=False)    #batch_size不要过大
+
+#模型训练
+train(model,opt,fold_num,EPOCH_NUM=10,visual_avalible=False)
+#加载模型
+model1 = Unet()
+model1.set_state_dict(paddle.load("model/model1_ED0.008243825249706058.pdparams"))
+model1.eval()
+
+model2 = Unet()
+model2.set_state_dict(paddle.load("model/model2_ED0.00708214607276843.pdparams"))
+model2.eval()
+
+model3 = Unet()
+model3.set_state_dict(paddle.load("model/model3_ED0.008693393679250788.pdparams"))
+model3.eval()
+
+model4 = Unet()
+model4.set_state_dict(paddle.load("model/model4_ED0.00877534777237888.pdparams"))
+model4.eval()
+
+model5 = Unet()
+model5.set_state_dict(paddle.load("model/model5_ED0.007696413964666473.pdparams"))
+model5.eval()
+model_list = [model1,model2,model3,model4,model5]
+
+#生成预测结果
+predict_list = []
+
+print('解算开始...')
+for index in range(100):
+    #载入测试数据
+    img,location = transfer_img_location(index,lr=test_lr[index],size=test_size[index],mode='test')
+    img = img[:,836:1444,840:1240]
+    features = np.array(img).astype('float32')
+    labels = np.array(get_gauss_map(location)).astype('float32')
+    features = paddle.to_tensor([features])
+
+
+    '''
+    这里的方法是对每个热力图做黑核搜索然后将坐标平均；另一种做法是先对热力图做平均，在对其使用黑核搜索（推荐尝试）
+    '''
+    PreX,PreY = 0,0
+    for model in model_list:
+        pre = model(features)[0].numpy()
+        if np.sum(pre) < 1000:
+            pre_x,pre_y = 304+80,200+40
+        else:
+            pre_x,pre_y = dark_kernel_process(pre[0],kernel_size=80)  #使用黑核搜索将热力图转为标签
+        PreX = pre_x + PreX
+        PreY = pre_y + PreY
+    PreX = PreX / 5
+    PreY = PreY / 5
+
+    PreX = PreX + 1140-304
+    PreY = PreY + 1040-200
+    if test_lr[index] == 1:
+        PreX = 1956 -PreX
+
+    if test_size[index] == 1:
+        PreX = PreX + 518
+        PreY = PreY + 33
+
+    print('图片：{}，预测结果：{}'.format(index+101,[PreX,PreY]))
+    predict_list.append([PreX,PreY])
+
+print('解算完毕！')
+#生成csv文件
+pre_list = []
+for index in range(100):
+    pre_list.append([index+101] + predict_list[index])
+dataframe = pd.DataFrame(pre_list)
+dataframe.columns=['data','Fovea_X','Fovea_Y']
+#最高得分9.07791
+dataframe.to_csv('pre{}.csv'.format(3),sep=',',index=False)  #format里自设数字，区分开提交的版本即可
